@@ -23,6 +23,7 @@ import {
 import { log } from './log.js';
 import { normalizeOptions } from './channels/ask-question.js';
 import { clearOutbox, openInboundDb, openOutboundDb, readOutboxFiles } from './session-manager.js';
+import { maybeVoiceReply } from './voice-reply.js';
 import { pauseTypingRefreshAfterDelivery, setTypingAdapter } from './modules/typing/index.js';
 import type { OutboundFile } from './channels/adapter.js';
 import type { Session } from './types.js';
@@ -367,13 +368,29 @@ async function deliverMessage(
       ? readOutboxFiles(session.agent_group_id, session.id, msg.id, content.files as string[])
       : undefined;
 
+  // Same medium as the inbound: a voice note is answered with a voice note.
+  // Decided here rather than in the agent's instructions, because the medium of
+  // a reply is a lookup, not a judgement — and the agent ignored the instruction
+  // three times running. Any failure returns undefined and the text goes out
+  // unchanged. See voice-reply.ts.
+  const attachments =
+    files ??
+    maybeVoiceReply({
+      kind: msg.kind,
+      channelType: msg.channel_type,
+      inReplyTo: msg.in_reply_to,
+      content,
+      groupFolder: getAgentGroup(session.agent_group_id)?.folder ?? '',
+      inDb,
+    });
+
   const platformMsgId = await deliveryAdapter.deliver(
     msg.channel_type,
     msg.platform_id,
     msg.thread_id,
     msg.kind,
     msg.content,
-    files,
+    attachments,
     deliverInstance,
   );
   log.info('Message delivered', {
@@ -381,7 +398,7 @@ async function deliverMessage(
     channelType: msg.channel_type,
     platformId: msg.platform_id,
     platformMsgId,
-    fileCount: files?.length,
+    fileCount: attachments?.length,
   });
 
   clearOutbox(session.agent_group_id, session.id, msg.id);
