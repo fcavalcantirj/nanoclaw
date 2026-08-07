@@ -121,3 +121,25 @@ export function getCurrentInReplyTo(): string | null {
   if (!Number.isFinite(age) || age > IN_REPLY_TO_MAX_AGE_MS) return null;
   return row.value;
 }
+
+/**
+ * Turn-end marker for external turn observers (the casaviva voice-relay).
+ *
+ * Upserted AFTER a result event's outbound rows are committed — poll-loop
+ * dispatches (writeMessageOut / deliverErrorResult) first and calls this
+ * second — so an observer that sees the value change knows every
+ * messages_out row of the turn that just ended is already visible. The
+ * value is an opaque change token: consumers compare it for inequality
+ * only, never parse it.
+ *
+ * ⚠ Why this exists: processing_ack is NOT a turn-end signal. Follow-up
+ * pushes mark 'completed' at prompt-push (poll-loop follow-up poll), and
+ * even the initial batch's ack commits before the reply row. An observer
+ * that trusted the ack lost whole replies (2026-08-07, casa-viva
+ * docs/handovers/2026-08-07-ptt-latency).
+ */
+let turnEndSeq = 0;
+export function markTurnDispatchEnd(): void {
+  turnEndSeq += 1;
+  setValue('turn_dispatch_end', `${Date.now().toString(36)}-${turnEndSeq}-${Math.random().toString(36).slice(2, 8)}`);
+}

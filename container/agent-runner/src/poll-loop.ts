@@ -5,6 +5,7 @@ import { getInboundDb, touchHeartbeat, clearStaleProcessingAcks } from './db/con
 import {
   clearContinuation,
   clearCurrentInReplyTo,
+  markTurnDispatchEnd,
   migrateLegacyContinuation,
   setContinuation,
   setCurrentInReplyTo,
@@ -494,6 +495,9 @@ export async function processQuery(
             // scratchpad, and skip the re-wrap nudge — it would just re-hammer
             // the failing gateway turn after turn.
             deliverErrorResult(event.text, routing);
+            // Error notice is a deliverable reply: its messages_out row is
+            // committed above, so the turn-end marker may stamp now.
+            markTurnDispatchEnd();
             notifyExchangeComplete(onExchangeComplete, {
               prompt: archivePrompts[0] ?? initialPrompt,
               result: event.text,
@@ -523,9 +527,19 @@ export async function processQuery(
             // The wrapping-retry result answers the SAME user prompt — keep it
             // queued so the retry archives against it, not the nudge text.
             if (!willRetryWrapping) archivePrompts.shift();
+            // Turn truly over (no retry pending): every messages_out row of
+            // this turn — mid-turn MCP sends and the dispatch above — is
+            // committed, so stamp the turn-end marker. A retry-pending
+            // result must NOT stamp: the real reply is a model turn away.
+            if (!willRetryWrapping) markTurnDispatchEnd();
           }
         } else {
+          // No result text: the agent replied via MCP mid-turn or chose
+          // silence. Either way the turn is over — stamp. An observer needs
+          // reply-row evidence in addition to the stamp, so a silent turn's
+          // stamp can never manufacture an empty "reply".
           archivePrompts.shift();
+          markTurnDispatchEnd();
         }
       }
     }

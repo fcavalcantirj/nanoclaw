@@ -454,3 +454,73 @@ describe('isCorruptionError', () => {
     expect(isCorruptionError('')).toBe(false);
   });
 });
+
+describe('turn-end marker (turn_dispatch_end)', () => {
+  function seedDest(name: string, channelType: string, platformId: string): void {
+    getInboundDb()
+      .prepare(
+        `INSERT INTO destinations (name, display_name, type, channel_type, platform_id, agent_group_id)
+         VALUES (?, ?, 'channel', ?, ?, NULL)`,
+      )
+      .run(name, name, channelType, platformId);
+  }
+  function markerValue(): string | undefined {
+    const row = getOutboundDb()
+      .prepare("SELECT value FROM session_state WHERE key = 'turn_dispatch_end'")
+      .get() as { value: string } | undefined;
+    return row?.value;
+  }
+
+  it('stamps after a dispatched wrapped result, AFTER the reply row commits (order pinned by trigger spy)', async () => {
+    seedDest('discord-main', 'discord', 'chan-1');
+    // Order spy: at marker-write time, record how many messages_out rows
+    // already exist. A mutation that stamps before dispatch reads 0 here.
+    getOutboundDb().exec(`
+      CREATE TABLE IF NOT EXISTS _marker_spy (rows_at_stamp INTEGER);
+      CREATE TRIGGER IF NOT EXISTS _marker_order AFTER INSERT ON session_state
+        WHEN NEW.key = 'turn_dispatch_end'
+        BEGIN INSERT INTO _marker_spy VALUES ((SELECT COUNT(*) FROM messages_out)); END;
+    `);
+    const { query } = makeResultQuery({ type: 'result', text: '<message to="discord-main">resposta</message>' });
+    await processQuery(query, ERR_ROUTING, ['m1'], 'claude', undefined, 'prompt', undefined);
+    expect(getUndeliveredMessages()).toHaveLength(1);
+    expect(markerValue()).toBeDefined();
+    const spy = getOutboundDb().prepare('SELECT rows_at_stamp FROM _marker_spy').all() as Array<{ rows_at_stamp: number }>;
+    expect(spy).toHaveLength(1);
+    expect(spy[0].rows_at_stamp).toBe(1);
+  });
+
+  it('does NOT stamp while the re-wrap nudge is pending (the reply is a model turn away)', async () => {
+    const { query, pushes } = makeResultQuery({ type: 'result', text: 'bare text, no envelope' });
+    await processQuery(query, ERR_ROUTING, ['m1'], 'claude', undefined, 'prompt', undefined);
+    expect(pushes).toHaveLength(1);
+    expect(markerValue()).toBeUndefined();
+  });
+
+  it('stamps after an error-result notice is delivered', async () => {
+    const { query } = makeResultQuery({ type: 'result', text: 'Spending limit reached.', isError: true });
+    await processQuery(query, ERR_ROUTING, ['m1'], 'claude', undefined, 'prompt', undefined);
+    expect(getUndeliveredMessages()).toHaveLength(1);
+    expect(markerValue()).toBeDefined();
+  });
+
+  it('stamps on a no-text result (MCP-mid-turn or silent turn)', async () => {
+    const { query } = makeResultQuery({ type: 'result', text: '' });
+    await processQuery(query, ERR_ROUTING, ['m1'], 'claude', undefined, 'prompt', undefined);
+    expect(getUndeliveredMessages()).toHaveLength(0);
+    expect(markerValue()).toBeDefined();
+  });
+
+  it('changes value on every stamped turn (the warm follow-up analog)', async () => {
+    seedDest('discord-main', 'discord', 'chan-1');
+    const first = makeResultQuery({ type: 'result', text: '<message to="discord-main">um</message>' });
+    await processQuery(first.query, ERR_ROUTING, ['m1'], 'claude', undefined, 'prompt', undefined);
+    const v1 = markerValue();
+    const second = makeResultQuery({ type: 'result', text: '<message to="discord-main">dois</message>' });
+    await processQuery(second.query, ERR_ROUTING, ['m2'], 'claude', undefined, 'prompt', undefined);
+    const v2 = markerValue();
+    expect(v1).toBeDefined();
+    expect(v2).toBeDefined();
+    expect(v2).not.toBe(v1);
+  });
+});
