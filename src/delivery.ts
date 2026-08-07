@@ -28,7 +28,7 @@ import { pauseTypingRefreshAfterDelivery, setTypingAdapter } from './modules/typ
 import type { OutboundFile } from './channels/adapter.js';
 import type { Session } from './types.js';
 
-const ACTIVE_POLL_MS = 1000;
+const ACTIVE_POLL_MS = 300; // 1000 → 300 (casaviva latency, 2026-08-07): reply-to-socket lag
 const SWEEP_POLL_MS = 60_000;
 const MAX_DELIVERY_ATTEMPTS = 3;
 

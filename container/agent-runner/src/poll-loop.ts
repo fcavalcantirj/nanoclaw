@@ -23,7 +23,7 @@ import { isUploadTraceCommand, uploadTrace } from './upload-trace.js';
 import type { AgentProvider, AgentQuery, ProviderEvent, ProviderExchange } from './providers/types.js';
 
 const POLL_INTERVAL_MS = 1000;
-const ACTIVE_POLL_INTERVAL_MS = 500;
+const ACTIVE_POLL_INTERVAL_MS = 250; // 500 → 250 (casaviva latency, 2026-08-07): halves avg follow-up pickup lag
 
 /**
  * Number of consecutive `database disk image is malformed` errors after which
