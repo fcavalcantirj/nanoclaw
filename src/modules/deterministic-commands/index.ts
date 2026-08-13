@@ -56,10 +56,38 @@ interface ReplyCommand {
 }
 type CommandSpec = ExecCommand | ReplyCommand;
 
+/**
+ * A text route lets an ALLOWED sender's bare free-text message dispatch a
+ * configured command deterministically (e.g. a caregiver replying just a
+ * number). Purely mechanism: the pattern and target command are config. The
+ * owner/allowlist guards run BEFORE routing, so the owner's free text is
+ * never intercepted, and unmatched free text still reaches the agent.
+ */
+export interface TextRoute {
+  re: string;
+  cmd: string;
+}
+
 interface DetCmdConfig {
   owner: string;
   allowed_senders: string[];
   commands: Record<string, CommandSpec>;
+  text_routes?: TextRoute[];
+}
+
+/** HARD validation: a broken route is a config error at load, never a 3am surprise. */
+export function validateTextRoutes(routes: unknown, commands: Record<string, CommandSpec>): void {
+  if (routes === undefined) return;
+  if (!Array.isArray(routes)) throw new Error('text_routes must be an array');
+  for (const r of routes as Array<Record<string, unknown>>) {
+    if (typeof r?.re !== 'string' || typeof r?.cmd !== 'string') {
+      throw new Error('every text_route needs {re: string, cmd: string}');
+    }
+    new RegExp(r.re); // throws on an invalid pattern
+    if (!(r.cmd in commands)) {
+      throw new Error(`text_route targets unknown command "${r.cmd}"`);
+    }
+  }
 }
 
 let cache: { mtimeMs: number; config: DetCmdConfig } | null = null;
@@ -83,6 +111,7 @@ function loadConfig(): DetCmdConfig | null {
     ) {
       throw new Error('deterministic-commands config must have owner/allowed_senders/commands');
     }
+    validateTextRoutes(raw.text_routes, raw.commands as Record<string, CommandSpec>);
     const config = raw as unknown as DetCmdConfig;
     cache = { mtimeMs: stat.mtimeMs, config };
     log.info('deterministic-commands config loaded', {
@@ -111,6 +140,26 @@ function parseCommand(text: string): { cmd: string; arg: string } | null {
   const m = /^\/([a-z0-9_]+)(?:@\w+)?(?:\s+(.*))?$/i.exec(text.trim());
   if (!m) return null;
   return { cmd: m[1].toLowerCase(), arg: (m[2] ?? '').trim() };
+}
+
+/**
+ * The routing seam (pure, unit-tested): slash first — semantics unchanged —
+ * then the config's text routes over the trimmed text. Null = free text,
+ * which routes to the agent as always.
+ */
+export function resolveCommand(
+  text: string,
+  config: { commands: Record<string, CommandSpec>; text_routes?: TextRoute[] },
+): { cmd: string; arg: string; via: 'slash' | 'text_route' } | null {
+  const slash = parseCommand(text);
+  if (slash) return { ...slash, via: 'slash' };
+  const trimmed = text.trim();
+  for (const r of config.text_routes ?? []) {
+    if (new RegExp(r.re).test(trimmed)) {
+      return { cmd: r.cmd, arg: trimmed, via: 'text_route' };
+    }
+  }
+  return null;
 }
 
 async function reply(event: InboundEvent, text: string): Promise<void> {
@@ -170,9 +219,11 @@ export async function interceptDeterministicCommand(event: InboundEvent): Promis
   if (!config.allowed_senders.includes(event.platformId)) return false; // strangers: normal routing/approval flow
 
   const text = parseText(event.message.content);
-  const parsed = parseCommand(text);
+  const parsed = resolveCommand(text, config);
   if (!parsed) return false; // free text still routes to the agent (fallback parser)
 
+  // Unknown command is reachable only via 'slash' — load-time validation
+  // guarantees every text_route targets an existing command.
   const spec = config.commands[parsed.cmd];
   if (!spec) {
     // Allowed sender, unknown/unliberated command: consume + refuse — commands
@@ -195,7 +246,11 @@ export async function interceptDeterministicCommand(event: InboundEvent): Promis
     const re = new RegExp(spec.arg_re);
     if (!re.test(parsed.arg)) {
       await reply(event, spec.usage ?? `uso: /${parsed.cmd} <argumento>`);
-      log.info('deterministic-commands: bad/missing arg', { platformId: event.platformId, cmd: parsed.cmd });
+      log.info('deterministic-commands: bad/missing arg', {
+        platformId: event.platformId,
+        cmd: parsed.cmd,
+        via: parsed.via,
+      });
       return true;
     }
   }
@@ -206,6 +261,7 @@ export async function interceptDeterministicCommand(event: InboundEvent): Promis
   log.info('deterministic-commands: executed', {
     platformId: event.platformId,
     cmd: parsed.cmd,
+    via: parsed.via,
     ms: Date.now() - started,
   });
   return true;
