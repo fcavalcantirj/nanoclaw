@@ -207,7 +207,7 @@ describe('legacy connected DM receipt ratification', () => {
       question: string;
       options: Array<{ value: string }>;
     };
-    expect(card.questionId).toMatch(/^cr:[A-Za-z0-9_-]{16}$/);
+    expect(card.questionId).toMatch(/^cr_[A-Za-z0-9_-]{16}$/);
     expect(card.question).toContain('Medusa');
     expect(card.question).toContain('Andy');
     expect(card.options.map((option) => option.value)).toEqual(['approve_connection_receipt', 'reject_connection_receipt']);
