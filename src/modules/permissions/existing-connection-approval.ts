@@ -7,6 +7,7 @@
  * replays the nurse's message.
  */
 import Database from 'better-sqlite3';
+import { createHash } from 'crypto';
 import fs from 'fs';
 
 import type { InboundEvent } from '../../channels/adapter.js';
@@ -39,6 +40,13 @@ export const REJECT_CONNECTION_RECEIPT = 'reject_connection_receipt';
 
 function namespacedPlatformId(channelType: string, platformId: string): string {
   return platformId.includes(':') ? platformId : `${channelType}:${platformId}`;
+}
+
+function connectionReceiptQuestionId(wiringId: string): string {
+  // Telegram serializes both the button id and option value into a callback
+  // capped at 64 bytes. A fixed 96-bit digest is deterministic, compact, and
+  // leaves ample framing room while the pending row retains the full wiring.
+  return `cr:${createHash('sha256').update(wiringId).digest('base64url').slice(0, 16)}`;
 }
 
 function identityFromEvent(event: InboundEvent): { userId: string; displayName: string } | null {
@@ -123,7 +131,7 @@ export async function requestExistingConnectionApproval(input: ExistingConnectio
     return false;
   }
 
-  const questionId = `connection-receipt:${wiring.id}`;
+  const questionId = connectionReceiptQuestionId(wiring.id);
   const title = '🔐 Aprovar identidade conectada';
   const question = `${eventIdentity.displayName} acabou de falar com ${agentGroup.name}. A conexão é anterior ao comprovante de identidade. Aprovar este Telegram para cadastro de plantão?`;
   const options = normalizeOptions([
