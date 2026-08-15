@@ -297,6 +297,12 @@ describe('unknown-channel registration flow', () => {
     // immediately; waiting for another owner message/container wake loses the
     // deterministic one-minute onboarding handoff.
     const { session: ownerSession } = resolveSession('ag-1', 'mg-dm-owner', null, 'shared');
+    const legacyOwnerInbound = openInboundDb('ag-1', ownerSession.id);
+    try {
+      legacyOwnerInbound.exec('DROP TABLE approved_connections');
+    } finally {
+      legacyOwnerInbound.close();
+    }
 
     await routeInbound(dmEvent('5426364345', 'hello', '5426364345', 'Medusa'));
     await new Promise((r) => setTimeout(r, 10));
