@@ -33,6 +33,17 @@ export function getResponseHandlers(): readonly ResponseHandler[] {
   return responseHandlers;
 }
 
+type StartupCallback = () => void | Promise<void>;
+const startupCallbacks: StartupCallback[] = [];
+
+export function onStartup(cb: StartupCallback): void {
+  startupCallbacks.push(cb);
+}
+
+export function getStartupCallbacks(): readonly StartupCallback[] {
+  return startupCallbacks;
+}
+
 type ShutdownCallback = () => void | Promise<void>;
 const shutdownCallbacks: ShutdownCallback[] = [];
 

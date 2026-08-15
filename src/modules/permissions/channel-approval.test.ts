@@ -18,8 +18,13 @@ import fs from 'fs';
 import { beforeEach, afterEach, describe, expect, it, vi } from 'vitest';
 
 import { initTestDb, closeDb, runMigrations } from '../../db/index.js';
+import { getDb } from '../../db/connection.js';
 import { createAgentGroup } from '../../db/agent-groups.js';
-import { createMessagingGroup, getMessagingGroupByPlatform } from '../../db/messaging-groups.js';
+import {
+  createMessagingGroup,
+  createMessagingGroupAgent,
+  getMessagingGroupByPlatform,
+} from '../../db/messaging-groups.js';
 import { upsertUser } from './db/users.js';
 import { grantRole } from './db/user-roles.js';
 
@@ -146,6 +151,227 @@ function dmEvent(platformId: string, text = 'hello', senderId = 'stranger', send
     },
   };
 }
+
+function seedLegacyConnectedDm() {
+  upsertUser({ id: 'telegram:medusa', kind: 'telegram', display_name: 'Medusa', created_at: now() });
+  createMessagingGroup({
+    id: 'mg-medusa',
+    channel_type: 'telegram',
+    platform_id: 'telegram:medusa',
+    name: null,
+    is_group: 0,
+    unknown_sender_policy: 'request_approval',
+    created_at: now(),
+  });
+  createMessagingGroupAgent({
+    id: 'mga-medusa-legacy',
+    messaging_group_id: 'mg-medusa',
+    agent_group_id: 'ag-1',
+    engage_mode: 'pattern',
+    engage_pattern: '.',
+    sender_scope: 'known',
+    ignored_message_policy: 'accumulate',
+    session_mode: 'shared',
+    priority: 0,
+    created_at: now(),
+  });
+  getDb()
+    .prepare(
+      `INSERT INTO agent_group_members (user_id, agent_group_id, added_by, added_at)
+       VALUES (?, ?, ?, ?)`,
+    )
+    .run('telegram:medusa', 'ag-1', 'telegram:owner', now());
+}
+
+describe('legacy connected DM receipt ratification', () => {
+  it('sends one owner card on a fresh DM when the existing wiring has no receipt', async () => {
+    seedLegacyConnectedDm();
+    const { routeInbound } = await import('../../router.js');
+    const { getDb } = await import('../../db/connection.js');
+
+    await routeInbound(dmEvent('telegram:medusa', 'oi', 'medusa', 'Medusa'));
+    await new Promise((r) => setTimeout(r, 10));
+
+    expect(deliverMock).toHaveBeenCalledTimes(1);
+    const card = JSON.parse(deliverMock.mock.calls[0][4] as string) as {
+      questionId: string;
+      question: string;
+      options: Array<{ value: string }>;
+    };
+    expect(card.question).toContain('Medusa');
+    expect(card.question).toContain('Andy');
+    expect(card.options.map((option) => option.value)).toEqual([
+      'approve_connection_receipt',
+      'reject_connection_receipt',
+    ]);
+    expect(getDb().prepare('SELECT COUNT(*) AS c FROM pending_connection_receipt_approvals').get()).toEqual({ c: 1 });
+
+    await routeInbound(dmEvent('telegram:medusa', 'de novo', 'medusa', 'Medusa'));
+    await new Promise((r) => setTimeout(r, 10));
+    expect(deliverMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('approves the old wiring atomically without rewiring or replaying the nurse message', async () => {
+    seedLegacyConnectedDm();
+    const { routeInbound } = await import('../../router.js');
+    const { getDb } = await import('../../db/connection.js');
+    const { getResponseHandlers } = await import('../../response-registry.js');
+    const { openInboundDb, resolveSession } = await import('../../session-manager.js');
+    const { wakeContainer } = await import('../../container-runner.js');
+    const { session: ownerSession } = resolveSession('ag-1', 'mg-dm-owner', null, 'shared');
+    (wakeContainer as unknown as ReturnType<typeof vi.fn>).mockClear();
+
+    await routeInbound(dmEvent('telegram:medusa', 'oi', 'medusa', 'Medusa'));
+    await new Promise((r) => setTimeout(r, 10));
+    const pending = getDb().prepare('SELECT question_id FROM pending_connection_receipt_approvals').get() as {
+      question_id: string;
+    };
+
+    for (const handler of getResponseHandlers()) {
+      const claimed = await handler({
+        questionId: pending.question_id,
+        value: 'approve_connection_receipt',
+        userId: 'owner',
+        channelType: 'telegram',
+        platformId: 'dm-owner',
+        threadId: null,
+      });
+      if (claimed) break;
+    }
+
+    expect(
+      getDb().prepare("SELECT COUNT(*) AS c FROM messaging_group_agents WHERE messaging_group_id = 'mg-medusa'").get(),
+    ).toEqual({ c: 1 });
+    expect(getDb().prepare('SELECT COUNT(*) AS c FROM pending_connection_receipt_approvals').get()).toEqual({ c: 0 });
+    expect(getDb().prepare('SELECT wiring_id, sender_display_name FROM channel_connection_receipts').get()).toEqual({
+      wiring_id: 'mga-medusa-legacy',
+      sender_display_name: 'Medusa',
+    });
+    expect(wakeContainer).toHaveBeenCalledTimes(1);
+    const ownerInbound = openInboundDb('ag-1', ownerSession.id);
+    try {
+      expect(ownerInbound.prepare('SELECT sender_display_name FROM approved_connections').get()).toEqual({
+        sender_display_name: 'Medusa',
+      });
+    } finally {
+      ownerInbound.close();
+    }
+  });
+
+  it('rejects only that message and does not deny or disconnect the existing DM', async () => {
+    seedLegacyConnectedDm();
+    const { routeInbound } = await import('../../router.js');
+    const { getResponseHandlers } = await import('../../response-registry.js');
+    const event = dmEvent('telegram:medusa', 'oi', 'medusa', 'Medusa');
+
+    await routeInbound(event);
+    await new Promise((r) => setTimeout(r, 10));
+    const pending = getDb().prepare('SELECT question_id FROM pending_connection_receipt_approvals').get() as {
+      question_id: string;
+    };
+    for (const handler of getResponseHandlers()) {
+      if (
+        await handler({
+          questionId: pending.question_id,
+          value: 'reject_connection_receipt',
+          userId: 'owner',
+          channelType: 'telegram',
+          platformId: 'dm-owner',
+          threadId: null,
+        })
+      )
+        break;
+    }
+
+    expect(getDb().prepare('SELECT COUNT(*) AS c FROM channel_connection_receipts').get()).toEqual({ c: 0 });
+    expect(getMessagingGroupByPlatform('telegram', 'telegram:medusa')?.denied_at).toBeFalsy();
+    expect(
+      getDb().prepare("SELECT COUNT(*) AS c FROM messaging_group_agents WHERE id = 'mga-medusa-legacy'").get(),
+    ).toEqual({ c: 1 });
+
+    deliverMock.mockClear();
+    const { requestExistingConnectionApproval } = await import('./existing-connection-approval.js');
+    await requestExistingConnectionApproval({
+      messagingGroupId: 'mg-medusa',
+      agentGroupId: 'ag-1',
+      senderUserId: 'telegram:medusa',
+      event,
+    });
+    expect(deliverMock).not.toHaveBeenCalled();
+
+    await routeInbound(dmEvent('telegram:medusa', 'nova mensagem', 'medusa', 'Medusa'));
+    await new Promise((r) => setTimeout(r, 10));
+    expect(deliverMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps the card pending when signing succeeds but receipt persistence fails', async () => {
+    seedLegacyConnectedDm();
+    const { routeInbound } = await import('../../router.js');
+    const { getResponseHandlers } = await import('../../response-registry.js');
+    await routeInbound(dmEvent('telegram:medusa', 'oi', 'medusa', 'Medusa'));
+    await new Promise((r) => setTimeout(r, 10));
+    const pending = getDb().prepare('SELECT question_id FROM pending_connection_receipt_approvals').get() as {
+      question_id: string;
+    };
+    getDb().exec(`
+      CREATE TRIGGER fail_legacy_connection_receipt
+      BEFORE INSERT ON channel_connection_receipts
+      BEGIN
+        SELECT RAISE(ABORT, 'forced legacy receipt failure');
+      END;
+    `);
+
+    await expect(async () => {
+      for (const handler of getResponseHandlers()) {
+        if (
+          await handler({
+            questionId: pending.question_id,
+            value: 'approve_connection_receipt',
+            userId: 'owner',
+            channelType: 'telegram',
+            platformId: 'dm-owner',
+            threadId: null,
+          })
+        )
+          break;
+      }
+    }).rejects.toThrow('forced legacy receipt failure');
+
+    expect(getDb().prepare('SELECT COUNT(*) AS c FROM pending_connection_receipt_approvals').get()).toEqual({ c: 1 });
+    expect(getDb().prepare('SELECT COUNT(*) AS c FROM channel_connection_receipts').get()).toEqual({ c: 0 });
+  });
+
+  it('recovers the exact receipt-rollout gap on startup without another nurse message', async () => {
+    seedLegacyConnectedDm();
+    const { resolveSession, writeSessionMessage } = await import('../../session-manager.js');
+    const { reconcileExistingConnectionApprovals } = await import('./existing-connection-approval.js');
+    const { session } = resolveSession('ag-1', 'mg-medusa', null, 'shared');
+    const timestamp = now();
+    writeSessionMessage('ag-1', session.id, {
+      id: 'msg-medusa-cutover-gap',
+      kind: 'chat',
+      timestamp,
+      platformId: 'telegram:medusa',
+      channelType: 'telegram',
+      threadId: null,
+      content: JSON.stringify({ senderId: 'medusa', senderName: 'Medusa', text: 'oi' }),
+    });
+    getDb()
+      .prepare("UPDATE schema_version SET applied = '2000-01-01T00:00:00.000Z' WHERE name = ?")
+      .run('channel-connection-receipts');
+    getDb()
+      .prepare("UPDATE schema_version SET applied = '2999-01-01T00:00:00.000Z' WHERE name = ?")
+      .run('pending-connection-receipt-approvals');
+
+    deliverMock.mockClear();
+    await reconcileExistingConnectionApprovals();
+
+    expect(deliverMock).toHaveBeenCalledTimes(1);
+    const payload = JSON.parse(deliverMock.mock.calls[0][4] as string) as { question: string };
+    expect(payload.question).toContain('Medusa');
+    expect(getDb().prepare('SELECT COUNT(*) AS c FROM pending_connection_receipt_approvals').get()).toEqual({ c: 1 });
+  });
+});
 
 describe('unknown-channel registration flow', () => {
   it('delivers an approval card on mention into an unwired group', async () => {

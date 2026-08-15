@@ -24,7 +24,12 @@ import { enforceUpgradeTripwire } from './upgrade-state.js';
 // effects, and the modules call registerResponseHandler/onShutdown at top
 // level — which would hit a TDZ error if the arrays lived here. Re-exported
 // here so existing callers see the same surface.
-import { getResponseHandlers, getShutdownCallbacks, type ResponsePayload } from './response-registry.js';
+import {
+  getResponseHandlers,
+  getShutdownCallbacks,
+  getStartupCallbacks,
+  type ResponsePayload,
+} from './response-registry.js';
 
 async function dispatchResponse(payload: ResponsePayload): Promise<void> {
   for (const handler of getResponseHandlers()) {
@@ -149,6 +154,16 @@ async function main(): Promise<void> {
   // offline adapter is never rerouted through a sibling bot. See
   // createChannelDeliveryAdapter in channels/channel-registry.ts.
   setDeliveryAdapter(createChannelDeliveryAdapter());
+
+  // Module recovery hooks run only after channel + delivery adapters exist.
+  // A hook failure is isolated so optional recovery cannot prevent startup.
+  for (const cb of getStartupCallbacks()) {
+    try {
+      await cb();
+    } catch (err) {
+      log.error('Startup callback threw', { err });
+    }
+  }
 
   // 5. Start delivery polls
   startActiveDeliveryPoll();

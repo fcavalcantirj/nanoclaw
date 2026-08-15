@@ -23,6 +23,12 @@ export function createChannelConnectionReceipt(receipt: ChannelConnectionReceipt
     .run(receipt);
 }
 
+export function getChannelConnectionReceiptByWiring(wiringId: string): ChannelConnectionReceipt | undefined {
+  return getDb().prepare('SELECT * FROM channel_connection_receipts WHERE wiring_id = ?').get(wiringId) as
+    | ChannelConnectionReceipt
+    | undefined;
+}
+
 export function listChannelConnectionReceiptsForApprover(
   approverUserId: string,
   agentGroupId: string,

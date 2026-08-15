@@ -148,6 +148,50 @@ CREATE TABLE pending_sender_approvals (
   created_at         TEXT NOT NULL,
   UNIQUE(messaging_group_id, sender_identity)
 );
+
+-- Append-only signed proof of an owner-approved channel identity.
+CREATE TABLE channel_connection_receipts (
+  receipt_id          TEXT PRIMARY KEY,
+  wiring_id           TEXT NOT NULL UNIQUE REFERENCES messaging_group_agents(id),
+  messaging_group_id  TEXT NOT NULL REFERENCES messaging_groups(id),
+  agent_group_id      TEXT NOT NULL REFERENCES agent_groups(id),
+  approver_user_id    TEXT NOT NULL REFERENCES users(id),
+  sender_user_id      TEXT NOT NULL REFERENCES users(id),
+  sender_display_name TEXT NOT NULL,
+  channel_type        TEXT NOT NULL,
+  instance            TEXT NOT NULL,
+  platform_id         TEXT NOT NULL,
+  approved_at         TEXT NOT NULL,
+  key_id              TEXT NOT NULL,
+  payload_b64         TEXT NOT NULL,
+  signature_b64       TEXT NOT NULL,
+  created_at          TEXT NOT NULL
+);
+
+-- In-flight owner card for a fresh DM on a pre-receipt wiring.
+CREATE TABLE pending_connection_receipt_approvals (
+  question_id         TEXT PRIMARY KEY,
+  wiring_id           TEXT NOT NULL UNIQUE REFERENCES messaging_group_agents(id) ON DELETE CASCADE,
+  messaging_group_id  TEXT NOT NULL REFERENCES messaging_groups(id) ON DELETE CASCADE,
+  agent_group_id      TEXT NOT NULL REFERENCES agent_groups(id) ON DELETE CASCADE,
+  sender_user_id      TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  sender_display_name TEXT NOT NULL,
+  original_message    TEXT NOT NULL,
+  approver_user_id    TEXT NOT NULL REFERENCES users(id),
+  created_at          TEXT NOT NULL,
+  title               TEXT NOT NULL,
+  options_json        TEXT NOT NULL
+);
+
+-- A rejection suppresses replay of that exact message while allowing a
+-- later fresh DM to request a new decision.
+CREATE TABLE connection_receipt_rejections (
+  wiring_id   TEXT NOT NULL REFERENCES messaging_group_agents(id) ON DELETE CASCADE,
+  message_id  TEXT NOT NULL,
+  rejected_by TEXT NOT NULL REFERENCES users(id),
+  rejected_at TEXT NOT NULL,
+  PRIMARY KEY (wiring_id, message_id)
+);
 `;
 
 /**

@@ -246,5 +246,12 @@ export function getAskQuestionRender(
     if (s?.title) return { title: s.title, options: JSON.parse(s.options_json) };
   }
 
+  if (hasTable(getDb(), 'pending_connection_receipt_approvals')) {
+    const r = getDb()
+      .prepare('SELECT title, options_json FROM pending_connection_receipt_approvals WHERE question_id = ?')
+      .get(id) as { title: string; options_json: string } | undefined;
+    if (r?.title) return { title: r.title, options: JSON.parse(r.options_json) };
+  }
+
   return undefined;
 }

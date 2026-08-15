@@ -57,6 +57,7 @@ import { getUser, upsertUser } from './db/users.js';
 import { requestSenderApproval } from './sender-approval.js';
 import { ensureUserDm } from './user-dm.js';
 import { createSignedConnectionReceipt } from './connection-receipt.js';
+import { requestExistingConnectionApproval } from './existing-connection-approval.js';
 
 // ── Free-text name input state ──
 // Tracks approvers waiting for a text reply with the agent name. Keyed by
@@ -206,6 +207,18 @@ setAccessGate((event, userId, mg, agentGroupId): AccessGateResult => {
 
   const decision = canAccessAgentGroup(userId, agentGroupId);
   if (decision.allowed) {
+    void requestExistingConnectionApproval({
+      messagingGroupId: mg.id,
+      agentGroupId,
+      senderUserId: userId,
+      event,
+    }).catch((err) =>
+      log.error('Existing connection approval flow threw', {
+        messagingGroupId: mg.id,
+        agentGroupId,
+        err,
+      }),
+    );
     return { allowed: true };
   }
 
