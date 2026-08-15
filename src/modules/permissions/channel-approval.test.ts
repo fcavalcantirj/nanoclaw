@@ -137,11 +137,17 @@ function groupMention(platformId: string, text = '@bot hello') {
   };
 }
 
-function dmEvent(platformId: string, text = 'hello', senderId = 'stranger', senderName = 'Stranger') {
+function dmEvent(
+  platformId: string,
+  text = 'hello',
+  senderId = 'stranger',
+  senderName = 'Stranger',
+  threadId: string | null = null,
+) {
   return {
     channelType: 'telegram',
     platformId,
-    threadId: null,
+    threadId,
     message: {
       id: `msg-${Math.random().toString(36).slice(2, 8)}`,
       kind: 'chat' as const,
@@ -189,7 +195,9 @@ describe('legacy connected DM receipt ratification', () => {
     const { routeInbound } = await import('../../router.js');
     const { getDb } = await import('../../db/connection.js');
 
-    await routeInbound(dmEvent('telegram:medusa', 'oi', 'medusa', 'Medusa'));
+    // The production Chat SDK bridge supplies the DM channel id as threadId.
+    // isGroup=false + the persisted messaging group are the DM authority.
+    await routeInbound(dmEvent('telegram:medusa', 'oi', 'medusa', 'Medusa', 'telegram:medusa'));
     await new Promise((r) => setTimeout(r, 10));
 
     expect(deliverMock).toHaveBeenCalledTimes(1);
@@ -200,11 +208,10 @@ describe('legacy connected DM receipt ratification', () => {
     };
     expect(card.question).toContain('Medusa');
     expect(card.question).toContain('Andy');
-    expect(card.options.map((option) => option.value)).toEqual([
-      'approve_connection_receipt',
-      'reject_connection_receipt',
-    ]);
-    expect(getDb().prepare('SELECT COUNT(*) AS c FROM pending_connection_receipt_approvals').get()).toEqual({ c: 1 });
+    expect(card.options.map((option) => option.value)).toEqual(['approve_connection_receipt', 'reject_connection_receipt']);
+    expect(
+      getDb().prepare('SELECT COUNT(*) AS c FROM pending_connection_receipt_approvals').get(),
+    ).toEqual({ c: 1 });
 
     await routeInbound(dmEvent('telegram:medusa', 'de novo', 'medusa', 'Medusa'));
     await new Promise((r) => setTimeout(r, 10));

@@ -83,7 +83,10 @@ export async function requestExistingConnectionApproval(input: ExistingConnectio
   }
 
   const mg = getMessagingGroup(input.messagingGroupId);
-  if (!mg || mg.is_group !== 0 || input.event.threadId !== null || input.event.message.isGroup === true) return false;
+  // The Chat SDK bridge represents Telegram DMs with the channel id in
+  // threadId. The persisted messaging-group kind plus isGroup are the DM
+  // authority; requiring a null thread silently rejected real Telegram DMs.
+  if (!mg || mg.is_group !== 0 || input.event.message.isGroup === true) return false;
   if (hasAdminPrivilege(input.senderUserId, input.agentGroupId)) return false;
 
   const eventIdentity = identityFromEvent(input.event);
