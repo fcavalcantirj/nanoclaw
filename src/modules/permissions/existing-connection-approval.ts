@@ -14,9 +14,9 @@ import { normalizeOptions } from '../../channels/ask-question.js';
 import { getAgentGroup } from '../../db/agent-groups.js';
 import { getDb } from '../../db/connection.js';
 import { getMessagingGroup, getMessagingGroupAgentByPair } from '../../db/messaging-groups.js';
-import { getDeliveryAdapter } from '../../delivery.js';
+import { getDeliveryAdapter, onDeliveryAdapterReady } from '../../delivery.js';
 import { log } from '../../log.js';
-import { onStartup, registerResponseHandler, type ResponsePayload } from '../../response-registry.js';
+import { registerResponseHandler, type ResponsePayload } from '../../response-registry.js';
 import { inboundDbPath, refreshApprovedConnectionsForApprover } from '../../session-manager.js';
 import { pickApprovalDelivery } from '../approvals/primitive.js';
 import { createSignedConnectionReceipt } from './connection-receipt.js';
@@ -409,4 +409,6 @@ export async function reconcileExistingConnectionApprovals(): Promise<void> {
   if (recovered > 0) log.info('Existing connection cutover recovery completed', { recovered });
 }
 
-onStartup(reconcileExistingConnectionApprovals);
+// Recovery needs a live channel adapter. Use the established adapter-ready
+// lifecycle hook so the one-time cutover card cannot race channel startup.
+onDeliveryAdapterReady(reconcileExistingConnectionApprovals);

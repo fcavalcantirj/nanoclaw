@@ -40,6 +40,7 @@ vi.mock('../../container-runner.js', () => ({
 const deliverMock = vi.fn().mockResolvedValue('plat-msg-id');
 vi.mock('../../delivery.js', () => ({
   getDeliveryAdapter: () => ({ deliver: deliverMock }),
+  onDeliveryAdapterReady: vi.fn(),
 }));
 
 // Mock ensureUserDm — look up the owner's preconfigured DM row instead of
