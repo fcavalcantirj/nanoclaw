@@ -23,6 +23,13 @@ export function getUserDmsForUser(userId: string): UserDm[] {
   return getDb().prepare('SELECT * FROM user_dms WHERE user_id = ?').all(userId) as UserDm[];
 }
 
+/** Resolve the user identity represented by a direct-message group. */
+export function getUserDmByMessagingGroup(messagingGroupId: string): UserDm | undefined {
+  return getDb().prepare('SELECT * FROM user_dms WHERE messaging_group_id = ? LIMIT 1').get(messagingGroupId) as
+    | UserDm
+    | undefined;
+}
+
 export function deleteUserDm(userId: string, channelType: string): void {
   getDb().prepare('DELETE FROM user_dms WHERE user_id = ? AND channel_type = ?').run(userId, channelType);
 }

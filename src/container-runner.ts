@@ -46,6 +46,7 @@ import {
 } from './providers/provider-container-registry.js';
 import {
   heartbeatPath,
+  inboundDbPath,
   markContainerRunning,
   markContainerStopped,
   sessionDir,
@@ -295,6 +296,15 @@ export function buildMounts(
 
   // Session folder at /workspace (contains inbound.db, outbound.db, outbox/, .claude/)
   mounts.push({ hostPath: sessDir, containerPath: '/workspace', readonly: false });
+
+  // inbound.db has exactly one writer: the host. Overlay the file read-only
+  // inside the otherwise writable session mount so an agent cannot forge
+  // approved-connection receipts or contend with host SQLite writes.
+  mounts.push({
+    hostPath: inboundDbPath(agentGroup.id, session.id),
+    containerPath: '/workspace/inbound.db',
+    readonly: true,
+  });
 
   // Agent group folder at /workspace/agent (RW for working files + CLAUDE.local.md)
   mounts.push({ hostPath: groupDir, containerPath: '/workspace/agent', readonly: false });

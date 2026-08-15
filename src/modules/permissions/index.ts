@@ -17,7 +17,8 @@
  */
 import { recordDroppedMessage } from '../../db/dropped-messages.js';
 import { getAgentGroup, getAllAgentGroups } from '../../db/agent-groups.js';
-import { createMessagingGroupAgent, setMessagingGroupDeniedAt } from '../../db/messaging-groups.js';
+import { getDb } from '../../db/connection.js';
+import { createMessagingGroupAgent, getMessagingGroup, setMessagingGroupDeniedAt } from '../../db/messaging-groups.js';
 import {
   routeInbound,
   setAccessGate,
@@ -31,6 +32,7 @@ import type { InboundEvent } from '../../channels/adapter.js';
 import { registerResponseHandler, type ResponsePayload } from '../../response-registry.js';
 import { getDeliveryAdapter } from '../../delivery.js';
 import { log } from '../../log.js';
+import { refreshApprovedConnectionsForApprover } from '../../session-manager.js';
 import type { MessagingGroup, MessagingGroupAgent } from '../../types.js';
 import { canAccessAgentGroup } from './access.js';
 import {
@@ -43,6 +45,7 @@ import {
   requestChannelApproval,
 } from './channel-approval.js';
 import { addMember } from './db/agent-group-members.js';
+import { createChannelConnectionReceipt } from './db/channel-connection-receipts.js';
 import {
   deletePendingChannelApproval,
   getPendingChannelApproval,
@@ -53,6 +56,7 @@ import { hasAdminPrivilege } from './db/user-roles.js';
 import { getUser, upsertUser } from './db/users.js';
 import { requestSenderApproval } from './sender-approval.js';
 import { ensureUserDm } from './user-dm.js';
+import { createSignedConnectionReceipt } from './connection-receipt.js';
 
 // ── Free-text name input state ──
 // Tracks approvers waiting for a text reply with the agent name. Keyed by
@@ -63,6 +67,25 @@ interface PendingNameInput {
   dmPlatformId: string;
 }
 const awaitingNameInput = new Map<string, PendingNameInput>();
+
+function senderDisplayName(event: InboundEvent, senderUserId: string): string | null {
+  const persisted = getUser(senderUserId)?.display_name?.trim();
+  if (persisted) return persisted;
+  try {
+    const content = JSON.parse(event.message.content) as Record<string, unknown>;
+    const author =
+      typeof content.author === 'object' && content.author !== null
+        ? (content.author as Record<string, unknown>)
+        : undefined;
+    const value =
+      (typeof content.senderName === 'string' ? content.senderName : undefined) ??
+      (typeof author?.fullName === 'string' ? author.fullName : undefined) ??
+      (typeof author?.userName === 'string' ? author.userName : undefined);
+    return typeof value === 'string' && value.trim() ? value.trim() : null;
+  } catch {
+    return null;
+  }
+}
 
 function extractAndUpsertUser(event: InboundEvent): string | null {
   let content: Record<string, unknown>;
@@ -207,6 +230,106 @@ setSenderScopeGate(
     return { allowed: false, reason: `sender_scope_${decision.reason}` };
   },
 );
+
+/**
+ * Commit the approval's wiring, sender membership, signed receipt and pending
+ * deletion as one SQLite transaction. Signing happens first so a missing key
+ * or unreadable key file cannot leave a half-approved channel behind.
+ */
+function commitApprovedChannelConnection(
+  messagingGroupId: string,
+  targetAgentGroupId: string,
+  approverId: string,
+  event: InboundEvent,
+): { mgaId: string; engageMode: MessagingGroupAgent['engage_mode'] } {
+  const mg = getMessagingGroup(messagingGroupId);
+  if (!mg) throw new Error(`Messaging group disappeared before approval commit: ${messagingGroupId}`);
+
+  const isGroup = event.threadId !== null;
+  const engageMode: MessagingGroupAgent['engage_mode'] = isGroup ? 'mention-sticky' : 'pattern';
+  const engagePattern = isGroup ? null : '.';
+  const approvedAt = new Date().toISOString();
+  const mgaId = `mga-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  const receiptId = `conn:${mgaId}`;
+  const senderUserId = extractAndUpsertUser(event);
+  const displayName = senderUserId ? senderDisplayName(event, senderUserId) : null;
+  const namespacedPlatformId = mg.platform_id.includes(':') ? mg.platform_id : `${mg.channel_type}:${mg.platform_id}`;
+  const signedReceipt =
+    senderUserId && displayName
+      ? createSignedConnectionReceipt({
+          receipt_id: receiptId,
+          wiring_id: mgaId,
+          messaging_group_id: messagingGroupId,
+          agent_group_id: targetAgentGroupId,
+          channel_type: mg.channel_type,
+          instance: mg.instance ?? mg.channel_type,
+          platform_id: namespacedPlatformId,
+          sender_user_id: senderUserId,
+          sender_display_name: displayName,
+          approver_user_id: approverId,
+          approved_at: approvedAt,
+        })
+      : null;
+
+  getDb().transaction(() => {
+    createMessagingGroupAgent({
+      id: mgaId,
+      messaging_group_id: messagingGroupId,
+      agent_group_id: targetAgentGroupId,
+      engage_mode: engageMode,
+      engage_pattern: engagePattern,
+      sender_scope: 'known',
+      ignored_message_policy: 'accumulate',
+      session_mode: 'shared',
+      priority: 0,
+      created_at: approvedAt,
+    });
+    if (senderUserId) {
+      addMember({
+        user_id: senderUserId,
+        agent_group_id: targetAgentGroupId,
+        added_by: approverId,
+        added_at: approvedAt,
+      });
+    }
+    if (signedReceipt) {
+      createChannelConnectionReceipt({ ...signedReceipt, created_at: approvedAt });
+    }
+    deletePendingChannelApproval(messagingGroupId);
+  })();
+
+  if (signedReceipt) {
+    try {
+      const refreshedSessions = refreshApprovedConnectionsForApprover(targetAgentGroupId, approverId);
+      log.info('Approved connection projected to approver sessions', {
+        receiptId: signedReceipt.receipt_id,
+        agentGroupId: targetAgentGroupId,
+        approverId,
+        refreshedSessions,
+      });
+    } catch (err) {
+      // The central receipt is durable and every later container wake retries
+      // the projection. Do not report the approval as failed after its atomic
+      // transaction has already committed.
+      log.error('Failed to refresh approved-connection session projection', {
+        receiptId: signedReceipt.receipt_id,
+        agentGroupId: targetAgentGroupId,
+        approverId,
+        err,
+      });
+    }
+  }
+
+  log.info('Channel registration approved — connection committed', {
+    messagingGroupId,
+    agentGroupId: targetAgentGroupId,
+    mgaId,
+    engageMode,
+    approverId,
+    receiptId: signedReceipt?.receipt_id ?? null,
+  });
+  return { mgaId, engageMode };
+}
 
 /**
  * Response handler for the unknown-sender approval card.
@@ -467,42 +590,7 @@ async function handleChannelApprovalResponse(payload: ResponsePayload): Promise<
     return true;
   }
 
-  const isGroup = event.threadId !== null;
-  const engageMode: MessagingGroupAgent['engage_mode'] = isGroup ? 'mention-sticky' : 'pattern';
-  const engagePattern = isGroup ? null : '.';
-
-  const mgaId = `mga-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-  createMessagingGroupAgent({
-    id: mgaId,
-    messaging_group_id: row.messaging_group_id,
-    agent_group_id: targetAgentGroupId,
-    engage_mode: engageMode,
-    engage_pattern: engagePattern,
-    sender_scope: 'known',
-    ignored_message_policy: 'accumulate',
-    session_mode: 'shared',
-    priority: 0,
-    created_at: new Date().toISOString(),
-  });
-  log.info('Channel registration approved — wiring created', {
-    messagingGroupId: row.messaging_group_id,
-    agentGroupId: targetAgentGroupId,
-    mgaId,
-    engageMode,
-    approverId,
-  });
-
-  const senderUserId = extractAndUpsertUser(event);
-  if (senderUserId) {
-    addMember({
-      user_id: senderUserId,
-      agent_group_id: targetAgentGroupId,
-      added_by: approverId,
-      added_at: new Date().toISOString(),
-    });
-  }
-
-  deletePendingChannelApproval(row.messaging_group_id);
+  commitApprovedChannelConnection(row.messaging_group_id, targetAgentGroupId, approverId, event);
 
   try {
     await routeInbound(event);
@@ -567,42 +655,7 @@ registerMessageInterceptor(async (event: InboundEvent): Promise<boolean> => {
     return true;
   }
 
-  const isGroup = originalEvent.threadId !== null;
-  const engageMode: MessagingGroupAgent['engage_mode'] = isGroup ? 'mention-sticky' : 'pattern';
-  const engagePattern = isGroup ? null : '.';
-
-  const mgaId = `mga-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-  createMessagingGroupAgent({
-    id: mgaId,
-    messaging_group_id: row.messaging_group_id,
-    agent_group_id: ag.id,
-    engage_mode: engageMode,
-    engage_pattern: engagePattern,
-    sender_scope: 'known',
-    ignored_message_policy: 'accumulate',
-    session_mode: 'shared',
-    priority: 0,
-    created_at: new Date().toISOString(),
-  });
-  log.info('Channel registration approved — wiring created', {
-    messagingGroupId: row.messaging_group_id,
-    agentGroupId: ag.id,
-    mgaId,
-    engageMode,
-    approverId: userId,
-  });
-
-  const senderUserId = extractAndUpsertUser(originalEvent);
-  if (senderUserId) {
-    addMember({
-      user_id: senderUserId,
-      agent_group_id: ag.id,
-      added_by: userId,
-      added_at: new Date().toISOString(),
-    });
-  }
-
-  deletePendingChannelApproval(row.messaging_group_id);
+  commitApprovedChannelConnection(row.messaging_group_id, ag.id, userId, originalEvent);
 
   try {
     await routeInbound(originalEvent);

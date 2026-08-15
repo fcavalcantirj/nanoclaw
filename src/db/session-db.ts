@@ -75,6 +75,37 @@ export function replaceDestinations(db: Database.Database, entries: DestinationR
   tx(entries);
 }
 
+export interface ApprovedConnectionRow {
+  receipt_id: string;
+  key_id: string;
+  payload_b64: string;
+  signature_b64: string;
+  agent_group_id: string;
+  approver_user_id: string;
+  channel_type: string;
+  platform_id: string;
+  sender_display_name: string;
+  approved_at: string;
+}
+
+/** Replace the owner-session receipt projection as one host-side transaction. */
+export function replaceApprovedConnections(db: Database.Database, entries: ApprovedConnectionRow[]): void {
+  const tx = db.transaction((rows: ApprovedConnectionRow[]) => {
+    db.prepare('DELETE FROM approved_connections').run();
+    const stmt = db.prepare(
+      `INSERT INTO approved_connections (
+         receipt_id, key_id, payload_b64, signature_b64, agent_group_id,
+         approver_user_id, channel_type, platform_id, sender_display_name, approved_at
+       ) VALUES (
+         @receipt_id, @key_id, @payload_b64, @signature_b64, @agent_group_id,
+         @approver_user_id, @channel_type, @platform_id, @sender_display_name, @approved_at
+       )`,
+    );
+    for (const row of rows) stmt.run(row);
+  });
+  tx(entries);
+}
+
 // ---------------------------------------------------------------------------
 // messages_in
 // ---------------------------------------------------------------------------
@@ -321,6 +352,18 @@ export function migrateMessagesInTable(db: Database.Database): void {
     // All existing rows are normal messages, so default 0.
     db.prepare('ALTER TABLE messages_in ADD COLUMN on_wake INTEGER NOT NULL DEFAULT 0').run();
   }
+  // Unlike the central DB, long-lived session DBs do not run numbered
+  // migrations. Ensure this additive host-owned projection for legacy
+  // sessions whenever the host opens inbound.db.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS approved_connections (
+      receipt_id TEXT PRIMARY KEY, key_id TEXT NOT NULL,
+      payload_b64 TEXT NOT NULL, signature_b64 TEXT NOT NULL,
+      agent_group_id TEXT NOT NULL, approver_user_id TEXT NOT NULL,
+      channel_type TEXT NOT NULL, platform_id TEXT NOT NULL,
+      sender_display_name TEXT NOT NULL, approved_at TEXT NOT NULL
+    );
+  `);
 }
 
 /**

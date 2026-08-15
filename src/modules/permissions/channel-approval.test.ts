@@ -13,6 +13,7 @@
  *  - No-owner install: no card, no row
  *  - No agent groups configured: no card, no row
  */
+import { generateKeyPairSync } from 'crypto';
 import fs from 'fs';
 import { beforeEach, afterEach, describe, expect, it, vi } from 'vitest';
 
@@ -58,6 +59,7 @@ vi.mock('../../config.js', async () => {
 });
 
 const TEST_DIR = '/tmp/nanoclaw-test-channel-approval';
+const RECEIPT_KEY_PATH = `${TEST_DIR}/connection-receipt-private.pem`;
 
 function now() {
   return new Date().toISOString();
@@ -66,6 +68,10 @@ function now() {
 beforeEach(async () => {
   if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
   fs.mkdirSync(TEST_DIR, { recursive: true });
+  const { privateKey } = generateKeyPairSync('ed25519');
+  fs.writeFileSync(RECEIPT_KEY_PATH, privateKey.export({ format: 'pem', type: 'pkcs8' }), { mode: 0o600 });
+  process.env.NANOCLAW_CONNECTION_RECEIPT_PRIVATE_KEY_PATH = RECEIPT_KEY_PATH;
+  process.env.NANOCLAW_CONNECTION_RECEIPT_KEY_ID = 'test-key-1';
   const db = initTestDb();
   runMigrations(db);
 
@@ -106,6 +112,8 @@ beforeEach(async () => {
 
 afterEach(() => {
   closeDb();
+  delete process.env.NANOCLAW_CONNECTION_RECEIPT_PRIVATE_KEY_PATH;
+  delete process.env.NANOCLAW_CONNECTION_RECEIPT_KEY_ID;
   if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
 });
 
@@ -124,7 +132,7 @@ function groupMention(platformId: string, text = '@bot hello') {
   };
 }
 
-function dmEvent(platformId: string, text = 'hello') {
+function dmEvent(platformId: string, text = 'hello', senderId = 'stranger', senderName = 'Stranger') {
   return {
     channelType: 'telegram',
     platformId,
@@ -132,7 +140,7 @@ function dmEvent(platformId: string, text = 'hello') {
     message: {
       id: `msg-${Math.random().toString(36).slice(2, 8)}`,
       kind: 'chat' as const,
-      content: JSON.stringify({ senderId: 'stranger', senderName: 'Stranger', text }),
+      content: JSON.stringify({ senderId, senderName, text }),
       timestamp: now(),
       isMention: true, // DM bridge sets isMention=true
     },
@@ -277,6 +285,138 @@ describe('unknown-channel registration flow', () => {
       .get(pending.messaging_group_id) as { engage_mode: string; engage_pattern: string };
     expect(mga.engage_mode).toBe('pattern');
     expect(mga.engage_pattern).toBe('.');
+  });
+
+  it('approve on a DM atomically records a signed, append-only connection receipt', async () => {
+    const { routeInbound } = await import('../../router.js');
+    const { getResponseHandlers } = await import('../../response-registry.js');
+    const { openInboundDb, resolveSession } = await import('../../session-manager.js');
+
+    // The owner's Claudius session is already alive when the nurse sends the
+    // first DM. The approval click must refresh this existing projection
+    // immediately; waiting for another owner message/container wake loses the
+    // deterministic one-minute onboarding handoff.
+    const { session: ownerSession } = resolveSession('ag-1', 'mg-dm-owner', null, 'shared');
+
+    await routeInbound(dmEvent('5426364345', 'hello', '5426364345', 'Medusa'));
+    await new Promise((r) => setTimeout(r, 10));
+
+    const { getDb } = await import('../../db/connection.js');
+    const pending = getDb().prepare('SELECT messaging_group_id FROM pending_channel_approvals').get() as {
+      messaging_group_id: string;
+    };
+
+    for (const handler of getResponseHandlers()) {
+      const claimed = await handler({
+        questionId: pending.messaging_group_id,
+        value: 'connect:ag-1',
+        userId: 'owner',
+        channelType: 'telegram',
+        platformId: 'dm-owner',
+        threadId: null,
+      });
+      if (claimed) break;
+    }
+
+    const receipt = getDb().prepare('SELECT * FROM channel_connection_receipts').get() as Record<string, string>;
+    expect(receipt.receipt_id).toMatch(/^conn:mga-/);
+    expect(receipt.messaging_group_id).toBe(pending.messaging_group_id);
+    expect(receipt.agent_group_id).toBe('ag-1');
+    expect(receipt.approver_user_id).toBe('telegram:owner');
+    expect(receipt.sender_user_id).toBe('telegram:5426364345');
+    expect(receipt.sender_display_name).toBe('Medusa');
+    expect(receipt.channel_type).toBe('telegram');
+    expect(receipt.platform_id).toBe('telegram:5426364345');
+    expect(receipt.key_id).toBe('test-key-1');
+    expect(receipt.payload_b64).not.toContain('5426364345');
+    expect(receipt.signature_b64.length).toBeGreaterThan(40);
+
+    const ownerInbound = openInboundDb('ag-1', ownerSession.id);
+    try {
+      const projected = ownerInbound.prepare('SELECT * FROM approved_connections').get() as Record<string, string>;
+      expect(projected).toMatchObject({
+        receipt_id: receipt.receipt_id,
+        agent_group_id: 'ag-1',
+        approver_user_id: 'telegram:owner',
+        sender_display_name: 'Medusa',
+      });
+    } finally {
+      ownerInbound.close();
+    }
+
+    const signedPayload = JSON.parse(Buffer.from(receipt.payload_b64, 'base64url').toString('utf8')) as Record<
+      string,
+      unknown
+    >;
+    expect(signedPayload).toMatchObject({
+      v: 1,
+      receipt_id: receipt.receipt_id,
+      key_id: 'test-key-1',
+      wiring_id: receipt.wiring_id,
+      messaging_group_id: pending.messaging_group_id,
+      agent_group_id: 'ag-1',
+      channel_type: 'telegram',
+      instance: 'telegram',
+      platform_id: 'telegram:5426364345',
+      sender_user_id: 'telegram:5426364345',
+      sender_display_name: 'Medusa',
+      approver_user_id: 'telegram:owner',
+      approved_at: receipt.approved_at,
+    });
+
+    expect(() =>
+      getDb().prepare('UPDATE channel_connection_receipts SET sender_display_name = ?').run('Rebound'),
+    ).toThrow();
+    expect(() => getDb().prepare('DELETE FROM channel_connection_receipts').run()).toThrow();
+  });
+
+  it('rolls back wiring, membership and pending deletion when receipt persistence fails', async () => {
+    const { routeInbound } = await import('../../router.js');
+    const { getResponseHandlers } = await import('../../response-registry.js');
+
+    await routeInbound(dmEvent('dm-atomic-failure'));
+    await new Promise((r) => setTimeout(r, 10));
+
+    const { getDb } = await import('../../db/connection.js');
+    const pending = getDb().prepare('SELECT messaging_group_id FROM pending_channel_approvals').get() as {
+      messaging_group_id: string;
+    };
+    getDb().exec(`
+      CREATE TRIGGER fail_connection_receipt
+      BEFORE INSERT ON channel_connection_receipts
+      BEGIN
+        SELECT RAISE(ABORT, 'forced receipt failure');
+      END;
+    `);
+
+    await expect(async () => {
+      for (const handler of getResponseHandlers()) {
+        const claimed = await handler({
+          questionId: pending.messaging_group_id,
+          value: 'connect:ag-1',
+          userId: 'owner',
+          channelType: 'telegram',
+          platformId: 'dm-owner',
+          threadId: null,
+        });
+        if (claimed) break;
+      }
+    }).rejects.toThrow('forced receipt failure');
+
+    expect(
+      getDb()
+        .prepare('SELECT 1 FROM messaging_group_agents WHERE messaging_group_id = ?')
+        .get(pending.messaging_group_id),
+    ).toBeUndefined();
+    expect(
+      getDb().prepare('SELECT 1 FROM agent_group_members WHERE user_id = ?').get('telegram:stranger'),
+    ).toBeUndefined();
+    expect(
+      getDb()
+        .prepare('SELECT 1 FROM pending_channel_approvals WHERE messaging_group_id = ?')
+        .get(pending.messaging_group_id),
+    ).toBeDefined();
+    expect(getDb().prepare('SELECT 1 FROM channel_connection_receipts').get()).toBeUndefined();
   });
 
   it('deny → sets denied_at; future mentions drop silently without a second card', async () => {

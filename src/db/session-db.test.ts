@@ -10,7 +10,12 @@ import fs from 'fs';
 import path from 'path';
 import { describe, it, expect, afterEach } from 'vitest';
 
-import { getInboundSourceSessionId, migrateMessagesInTable } from './session-db.js';
+import {
+  ensureSchema,
+  getInboundSourceSessionId,
+  migrateMessagesInTable,
+  replaceApprovedConnections,
+} from './session-db.js';
 
 const TEST_DIR = '/tmp/nanoclaw-session-db-test';
 const DB_PATH = path.join(TEST_DIR, 'inbound.db');
@@ -89,6 +94,53 @@ describe('migrateMessagesInTable', () => {
 
     expect(getInboundSourceSessionId(db, 'legacy-2')).toBeNull();
     expect(getInboundSourceSessionId(db, 'does-not-exist')).toBeNull();
+    db.close();
+  });
+});
+
+describe('approved connection projection', () => {
+  it('creates the host-owned projection on fresh inbound databases and replaces it atomically', () => {
+    if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
+    fs.mkdirSync(TEST_DIR, { recursive: true });
+    ensureSchema(DB_PATH, 'inbound');
+    const db = new Database(DB_PATH);
+
+    const first = {
+      receipt_id: 'conn:1',
+      key_id: 'key-1',
+      payload_b64: 'payload-1',
+      signature_b64: 'signature-1',
+      agent_group_id: 'ag-1',
+      approver_user_id: 'telegram:owner',
+      channel_type: 'telegram',
+      platform_id: 'hidden-1',
+      sender_display_name: 'Medusa',
+      approved_at: '2026-08-15T18:08:37.000Z',
+    };
+    replaceApprovedConnections(db, [first]);
+    expect(db.prepare('SELECT * FROM approved_connections').all()).toEqual([first]);
+
+    const second = { ...first, receipt_id: 'conn:2', platform_id: 'hidden-2', sender_display_name: 'Rafael' };
+    replaceApprovedConnections(db, [second]);
+    expect(db.prepare('SELECT * FROM approved_connections').all()).toEqual([second]);
+    db.close();
+  });
+
+  it('adds the projection table to a legacy inbound database', () => {
+    if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
+    fs.mkdirSync(TEST_DIR, { recursive: true });
+    const db = new Database(DB_PATH);
+    db.exec(`
+      CREATE TABLE messages_in (
+        id TEXT PRIMARY KEY, seq INTEGER UNIQUE, kind TEXT NOT NULL,
+        timestamp TEXT NOT NULL, status TEXT DEFAULT 'pending', content TEXT NOT NULL
+      );
+    `);
+
+    migrateMessagesInTable(db);
+    expect(
+      db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='approved_connections'").get(),
+    ).toBeDefined();
     db.close();
   });
 });

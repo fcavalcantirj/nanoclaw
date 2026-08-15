@@ -159,6 +159,7 @@ describe('buildMounts agent surfaces', () => {
     expect(byContainerPath.has('/home/node/.claude')).toBe(true);
     expect(byContainerPath.has('/app/CLAUDE.md')).toBe(true);
     expect(byContainerPath.has('/workspace/agent/CLAUDE.md')).toBe(true);
+    expect(byContainerPath.get('/workspace/inbound.db')?.readonly).toBe(true);
     // Composer ran: the generated project doc exists on disk.
     expect(fs.existsSync(path.join(GROUPS_DIR, ag.folder, 'CLAUDE.md'))).toBe(true);
   });

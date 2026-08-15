@@ -25,6 +25,7 @@ import {
   findSessionByAgentGroup,
   findSessionForAgent,
   getSession,
+  getSessionsByAgentGroup,
   updateSession,
 } from './db/sessions.js';
 import {
@@ -35,7 +36,10 @@ import {
   upsertSessionRouting,
   insertMessage,
   migrateMessagesInTable,
+  replaceApprovedConnections,
 } from './db/session-db.js';
+import { listChannelConnectionReceiptsForApprover } from './modules/permissions/db/channel-connection-receipts.js';
+import { getUserDmByMessagingGroup } from './modules/permissions/db/user-dms.js';
 import { log } from './log.js';
 import type { Session } from './types.js';
 
@@ -150,11 +154,16 @@ export function writeSessionRouting(agentGroupId: string, sessionId: string): vo
 
   let channelType: string | null = null;
   let platformId: string | null = null;
+  let sessionUserId: string | null = null;
   if (session.messaging_group_id) {
     const mg = getMessagingGroup(session.messaging_group_id);
     if (mg) {
       channelType = mg.channel_type;
       platformId = mg.platform_id;
+      // user_dms is the authoritative mapping between a DM transport and the
+      // namespaced user who owns it. The raw DM platform id is not guaranteed
+      // to equal the sender user id (and deliberately differs in tests).
+      sessionUserId = getUserDmByMessagingGroup(mg.id)?.user_id ?? null;
     }
   }
 
@@ -165,10 +174,53 @@ export function writeSessionRouting(agentGroupId: string, sessionId: string): vo
       platform_id: platformId,
       thread_id: session.thread_id,
     });
+    const approverUserId =
+      sessionUserId ??
+      (channelType && platformId ? (platformId.includes(':') ? platformId : `${channelType}:${platformId}`) : null);
+    const receipts = approverUserId ? listChannelConnectionReceiptsForApprover(approverUserId, agentGroupId) : [];
+    replaceApprovedConnections(
+      db,
+      receipts.map((receipt) => ({
+        receipt_id: receipt.receipt_id,
+        key_id: receipt.key_id,
+        payload_b64: receipt.payload_b64,
+        signature_b64: receipt.signature_b64,
+        agent_group_id: receipt.agent_group_id,
+        approver_user_id: receipt.approver_user_id,
+        channel_type: receipt.channel_type,
+        platform_id: receipt.platform_id,
+        sender_display_name: receipt.sender_display_name,
+        approved_at: receipt.approved_at,
+      })),
+    );
   } finally {
     db.close();
   }
   log.debug('Session routing written', { sessionId, channelType, platformId, threadId: session.thread_id });
+}
+
+/**
+ * Refresh already-created sessions belonging to the approving user.
+ *
+ * Approval cards are handled by the host while Claudius may already be
+ * running. Projecting synchronously after the central receipt commit makes
+ * the signed identity available to that live session without waiting for a
+ * later owner message or container restart.
+ */
+export function refreshApprovedConnectionsForApprover(agentGroupId: string, approverUserId: string): number {
+  let refreshed = 0;
+  for (const session of getSessionsByAgentGroup(agentGroupId)) {
+    if (session.status !== 'active' || !session.messaging_group_id) continue;
+    const mg = getMessagingGroup(session.messaging_group_id);
+    if (!mg) continue;
+    const sessionUserId =
+      getUserDmByMessagingGroup(mg.id)?.user_id ??
+      (mg.platform_id.includes(':') ? mg.platform_id : `${mg.channel_type}:${mg.platform_id}`);
+    if (sessionUserId !== approverUserId) continue;
+    writeSessionRouting(agentGroupId, session.id);
+    refreshed++;
+  }
+  return refreshed;
 }
 
 /**

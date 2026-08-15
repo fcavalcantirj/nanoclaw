@@ -221,6 +221,22 @@ CREATE TABLE IF NOT EXISTS session_routing (
   platform_id  TEXT,
   thread_id    TEXT
 );
+
+-- Host-authored projection of signed channel approvals belonging to this
+-- exact approver session and agent. The container may read but must not write
+-- this table; inbound.db is nested-mounted read-only at container startup.
+CREATE TABLE IF NOT EXISTS approved_connections (
+  receipt_id          TEXT PRIMARY KEY,
+  key_id              TEXT NOT NULL,
+  payload_b64         TEXT NOT NULL,
+  signature_b64       TEXT NOT NULL,
+  agent_group_id      TEXT NOT NULL,
+  approver_user_id    TEXT NOT NULL,
+  channel_type        TEXT NOT NULL,
+  platform_id         TEXT NOT NULL,
+  sender_display_name TEXT NOT NULL,
+  approved_at         TEXT NOT NULL
+);
 `;
 
 /** Container-owned: outbound messages + processing acknowledgments. */

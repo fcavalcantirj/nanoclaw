@@ -925,6 +925,104 @@ describe('writeSessionRouting', () => {
     expect(row!.thread_id).toBeNull();
   });
 
+  it('projects only receipts approved by this exact session identity and agent', () => {
+    createAgentGroup({
+      id: 'ag-1',
+      name: 'Agent',
+      folder: 'agent',
+      agent_provider: null,
+      created_at: now(),
+    });
+    createMessagingGroup({
+      id: 'mg-owner',
+      channel_type: 'telegram',
+      platform_id: '12345',
+      name: 'Owner DM',
+      is_group: 0,
+      unknown_sender_policy: 'public',
+      created_at: now(),
+    });
+    for (const [mgId, platformId] of [
+      ['mg-nurse-1', '50001'],
+      ['mg-nurse-2', '50002'],
+    ]) {
+      createMessagingGroup({
+        id: mgId,
+        channel_type: 'telegram',
+        platform_id: platformId,
+        name: mgId,
+        is_group: 0,
+        unknown_sender_policy: 'public',
+        created_at: now(),
+      });
+      createMessagingGroupAgent({
+        id: `mga-${mgId}`,
+        messaging_group_id: mgId,
+        agent_group_id: 'ag-1',
+        engage_mode: 'pattern',
+        engage_pattern: '.',
+        sender_scope: 'known',
+        ignored_message_policy: 'accumulate',
+        session_mode: 'shared',
+        priority: 0,
+        created_at: now(),
+      });
+    }
+    getDb()
+      .prepare('INSERT INTO users (id, kind, display_name, created_at) VALUES (?, ?, ?, ?)')
+      .run('telegram:12345', 'telegram', 'Owner', now());
+    getDb()
+      .prepare('INSERT INTO users (id, kind, display_name, created_at) VALUES (?, ?, ?, ?)')
+      .run('telegram:other', 'telegram', 'Other', now());
+    for (const receipt of [
+      {
+        receipt_id: 'conn:owner',
+        wiring_id: 'mga-mg-nurse-1',
+        messaging_group_id: 'mg-nurse-1',
+        approver_user_id: 'telegram:12345',
+        sender_user_id: 'telegram:50001',
+        sender_display_name: 'Medusa',
+        platform_id: 'telegram:50001',
+      },
+      {
+        receipt_id: 'conn:other',
+        wiring_id: 'mga-mg-nurse-2',
+        messaging_group_id: 'mg-nurse-2',
+        approver_user_id: 'telegram:other',
+        sender_user_id: 'telegram:50002',
+        sender_display_name: 'Rafael',
+        platform_id: 'telegram:50002',
+      },
+    ]) {
+      getDb()
+        .prepare('INSERT INTO users (id, kind, display_name, created_at) VALUES (?, ?, ?, ?)')
+        .run(receipt.sender_user_id, 'telegram', receipt.sender_display_name, now());
+      getDb()
+        .prepare(
+          `INSERT INTO channel_connection_receipts (
+             receipt_id, wiring_id, messaging_group_id, agent_group_id,
+             approver_user_id, sender_user_id, sender_display_name,
+             channel_type, instance, platform_id, approved_at,
+             key_id, payload_b64, signature_b64, created_at
+           ) VALUES (
+             @receipt_id, @wiring_id, @messaging_group_id, 'ag-1',
+             @approver_user_id, @sender_user_id, @sender_display_name,
+             'telegram', 'telegram', @platform_id, @approved_at,
+             'key-1', 'payload', 'signature', @approved_at
+           )`,
+        )
+        .run({ ...receipt, approved_at: now() });
+    }
+
+    const { session } = resolveSession('ag-1', 'mg-owner', null, 'shared');
+    writeSessionRouting('ag-1', session.id);
+
+    const db = new Database(inboundDbPath('ag-1', session.id), { readonly: true });
+    const rows = db.prepare('SELECT receipt_id, sender_display_name FROM approved_connections').all();
+    db.close();
+    expect(rows).toEqual([{ receipt_id: 'conn:owner', sender_display_name: 'Medusa' }]);
+  });
+
   it('writes null routing for agent-shared session (no messaging group)', () => {
     createAgentGroup({
       id: 'ag-1',
